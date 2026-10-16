@@ -5,34 +5,38 @@ import queue
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import tkinter as tk
 
 SERVICE_FILE = os.path.expanduser('~/.local/state/opencode/service.json')
 BASIC_USER = 'opencode'
+LOOPBACK_HOSTS = frozenset(('localhost', '127.0.0.1', '::1'))
 SPEED_MIN_SECONDS = 0.05
 SPEED_MAX_SECONDS = 600.0
+SCAN_LIMIT = 5
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
 
 
 class ServiceError(Exception):
     pass
 
 
-def calc_speed(tokens, streamed, completed):
-    if not isinstance(streamed, (int, float)) or not isinstance(completed, (int, float)):
-        return None
-    return calc_speed_seconds(tokens, (completed - streamed) / 1000.0)
-
-
-def calc_speed_seconds(tokens, seconds):
-    if tokens is None or seconds <= 0:
-        return None
+def calc_speed(tokens, created, completed):
+    if tokens is None or not isinstance(created, (int, float)) or not isinstance(completed, (int, float)):
+        return None, None
+    seconds = (completed - created) / 1000.0
     total = (tokens.get('output', 0) or 0) + (tokens.get('reasoning', 0) or 0)
-    if total <= 0:
-        return None
-    if seconds < SPEED_MIN_SECONDS or seconds > SPEED_MAX_SECONDS:
-        return None
-    return total / seconds
+    if total <= 0 or seconds < SPEED_MIN_SECONDS or seconds > SPEED_MAX_SECONDS:
+        return None, None
+    return total / seconds, seconds
 
 
 def calc_hit(tokens):
@@ -47,6 +51,37 @@ def calc_hit(tokens):
     return read / total * 100.0 if total > 0 else None
 
 
+def calc_stats(message):
+    info = message.get('time') or {}
+    tokens = message.get('tokens')
+    speed, seconds = calc_speed(tokens, info.get('created'), info.get('completed'))
+    return {
+        'tokens': tokens if tokens else None,
+        'hit': calc_hit(tokens),
+        'speed': speed,
+        'seconds': seconds,
+        'model': message.get('model'),
+    }
+
+
+def is_completed(message):
+    info = message.get('time') or {}
+    return bool(info.get('completed')) and bool(message.get('tokens'))
+
+
+def find_completed(messages):
+    checked = 0
+    for message in messages:
+        if message.get('type') != 'assistant' or not message.get('id'):
+            continue
+        if checked >= SCAN_LIMIT:
+            return None
+        checked += 1
+        if is_completed(message):
+            return message
+    return None
+
+
 def fmt_tok(value):
     value = int(value)
     if value >= 1000000:
@@ -56,12 +91,16 @@ def fmt_tok(value):
     return str(value)
 
 
-def fmt_speed(value):
+def fmt_speed(value, seconds):
     if value is None:
         return '計測不可'
     if value >= 1000:
-        return '%.1fK tok/s' % (value / 1000)
-    return '%.1f tok/s' % value
+        out = '%.1fK tok/s' % (value / 1000)
+    else:
+        out = '%.1f tok/s' % value
+    if seconds is not None:
+        out += ' (%.1fs)' % seconds
+    return out
 
 
 def fmt_hit(value):
@@ -82,6 +121,11 @@ class Service:
         self.auth = None
         self.mtime = 0.0
 
+    def invalidate(self):
+        self.url = None
+        self.auth = None
+        self.mtime = 0.0
+
     def reload(self):
         try:
             current = os.path.getmtime(SERVICE_FILE)
@@ -90,52 +134,52 @@ class Service:
         if current == self.mtime and self.mtime:
             return self.url is not None
         if not current:
-            self.url = None
-            self.auth = None
-            self.mtime = 0.0
+            self.invalidate()
             return False
         try:
             with open(SERVICE_FILE, encoding='utf-8') as handle:
                 reg = json.load(handle)
-            url = reg.get('url')
+            raw_url = reg.get('url')
             password = reg.get('password')
         except (OSError, ValueError):
             return False
-        if not url or not password:
+        if not raw_url or not password:
+            return False
+        parsed = urllib.parse.urlparse(str(raw_url))
+        if parsed.scheme != 'http' or parsed.hostname not in LOOPBACK_HOSTS:
             return False
         token = 'Basic ' + base64.b64encode(
             (BASIC_USER + ':' + password).encode('utf-8')).decode('ascii')
-        self.url = str(url).rstrip('/')
+        self.url = str(raw_url).rstrip('/')
         self.auth = token
         self.mtime = current
         return True
 
     def get(self, path):
-        if not self.reload():
+        if not self.reload() or not self.url:
             raise ServiceError('service not registered')
         request = urllib.request.Request(self.url + path, headers={
             'Authorization': self.auth,
             'Accept': 'application/json',
         })
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with OPENER.open(request, timeout=5) as response:
                 return json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as error:
             if error.code == 401:
-                self.url = None
-                self.auth = None
+                self.invalidate()
             raise ServiceError('HTTP %s' % error.code) from error
         except (urllib.error.URLError, TimeoutError, ValueError) as error:
             raise ServiceError(str(error)) from error
 
     def stream(self):
-        if not self.reload():
+        if not self.reload() or not self.url:
             raise ServiceError('service not registered')
         request = urllib.request.Request(self.url + '/api/event', headers={
             'Authorization': self.auth,
             'Accept': 'text/event-stream',
         })
-        return urllib.request.urlopen(request, timeout=30)
+        return OPENER.open(request, timeout=30)
 
     def session_info(self, sid):
         return self.get('/api/session/' + sid).get('data') or {}
@@ -151,13 +195,14 @@ class Service:
         return list(data) if isinstance(data, dict) else []
 
     def recent_sessions(self):
-        return self.get('/api/session?limit=20&order=desc').get('data') or []
+        return (self.get('/api/session').get('data') or [])[:20]
 
 
 class App:
     def __init__(self):
         self.service = Service()
         self.q = queue.Queue()
+        self.apiq = queue.Queue()
         self.running = True
 
         self.target_sid = None
@@ -167,12 +212,11 @@ class App:
         self.connected = False
         self.status = 'idle'
         self.last_speed = None
+        self.last_seconds = None
         self.last_hit = None
         self.last_tokens = None
         self.current_model = None
         self.session_titles = {}
-        self.monitored_at = 0.0
-        self.refreshed_at = 0.0
 
         self.root = tk.Tk()
         self.root.title('OpenCode 統計')
@@ -201,14 +245,15 @@ class App:
         self.model_label = label(8, 'normal', '#9a9a9a', 'model: -')
         self.session_label = label(8, 'normal', '#9a9a9a', 'session: -')
 
-        self.root.bind('<Button-3>', lambda event: self.menu(event))
+        self.root.bind('<Button-3>', self.menu)
         threading.Thread(target=self.event_loop, daemon=True).start()
+        threading.Thread(target=self.api_worker, daemon=True).start()
         self.root.after(250, self.poll_queue)
 
-    def menu(self, event=None):
+    def menu(self, event):
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label='統計を再取得',
-                         command=lambda: self.q.put(('refresh-stats', None, None)))
+                         command=lambda: self.apiq.put(('refresh-all', None, None)))
         menu.add_separator()
         menu.add_radiobutton(label='自動（実行中セッションを追従）',
                              variable=self.menu_pin, value='__auto__',
@@ -221,18 +266,17 @@ class App:
         menu.add_checkbutton(label='常に最前面', variable=self.topmost_var,
                              command=self.toggle_topmost)
         menu.add_command(label='閉じる', command=self.close)
-        if event is not None:
-            try:
-                menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                menu.grab_release()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def toggle_topmost(self):
         self.root.attributes('-topmost', self.topmost_var.get())
 
     def pin_session(self, sid):
         self.pinned_sid = sid
-        self.q.put(('session-change', sid, None))
+        self.switch_target(sid)
 
     def release_pin(self):
         self.pinned_sid = None
@@ -286,29 +330,64 @@ class App:
             return
         if kind.startswith('session.execution.'):
             self.q.put(('execution', sid, kind.rsplit('.', 1)[-1]))
-        elif kind == 'session.step.started':
-            if data.get('assistantMessageID'):
-                self.q.put(('step-started', sid, data['assistantMessageID']))
-        elif kind in ('session.step.ended', 'session.step.failed'):
-            if data.get('assistantMessageID'):
-                self.q.put(('step-ended', sid, data['assistantMessageID']))
+        elif kind == 'session.step.ended':
+            mid = data.get('assistantMessageID')
+            if mid:
+                self.apiq.put(('step-detail', sid, mid))
 
-    def dispatch(self, kind, param, extra):
-        if kind == 'connected':
-            self.on_connection(bool(extra))
-        elif kind == 'execution':
-            self.on_execution(param, extra)
-        elif kind == 'step-started':
-            self.on_step_started(param, extra)
-        elif kind == 'step-ended':
-            self.on_step_ended(param, extra)
-        elif kind == 'refresh-stats':
-            self.refresh_active()
-            self.refresh_target()
-            self.sync_last_message()
-        elif kind == 'session-change':
-            self.target_sid = param
-            self.sync_last_message()
+    def api_worker(self):
+        last_refresh = 0.0
+        while self.running:
+            try:
+                kind, sid, mid = self.apiq.get(timeout=1.0)
+                if kind == 'refresh-all':
+                    last_refresh = time.time()
+                    self.job_refresh_all()
+                elif kind == 'target-sync':
+                    self.job_target_sync(sid)
+                elif kind == 'step-detail':
+                    self.job_step_detail(sid, mid)
+            except queue.Empty:
+                now = time.time()
+                if self.connected and now - last_refresh >= 15.0:
+                    last_refresh = now
+                    try:
+                        self.job_refresh_all()
+                    except Exception:
+                        self.q.put(('connected', None, False))
+                continue
+            except Exception:
+                self.q.put(('connected', None, False))
+
+    def job_refresh_all(self):
+        active = self.service.active_sessions()
+        self.q.put(('active-list', frozenset(active), None))
+        recent = []
+        titles = {}
+        for session in self.service.recent_sessions():
+            sid = session.get('id')
+            if not sid:
+                continue
+            title = session.get('title') or 'no title'
+            recent.append((sid, title, sid in active))
+            titles[sid] = title
+        self.q.put(('session-list', recent, titles))
+
+    def job_target_sync(self, sid):
+        info = self.service.session_info(sid)
+        title = info.get('title') or 'no title'
+        stat = calc_stats(find_completed(self.service.session_messages(sid)) or {})
+        self.q.put(('target-stats', sid, {
+            'title': title,
+            'stat': stat,
+            'model': stat.get('model') or info.get('model'),
+            'running': sid in self.service.active_sessions(),
+        }))
+
+    def job_step_detail(self, sid, mid):
+        detail = self.service.message_detail(sid, mid)
+        if is_completed(detail):
+            self.q.put(('step-stats', sid, calc_stats(detail)))
 
     def poll_queue(self):
         if not self.running:
@@ -318,141 +397,96 @@ class App:
                 kind, param, extra = self.q.get_nowait()
             except queue.Empty:
                 break
-            try:
-                self.dispatch(kind, param, extra)
-            except ServiceError:
-                self.connected = False
-        now = time.time()
-        if now - self.monitored_at >= 5.0:
-            self.monitored_at = now
-            self.service.reload()
-            if now - self.refreshed_at >= 15.0:
-                self.refreshed_at = now
-                self.refresh_active()
-                self.refresh_target()
+            self.dispatch(kind, param, extra)
         self.render()
         if self.running:
             self.root.after(250, self.poll_queue)
 
-    def on_connection(self, value):
-        changed = self.connected != value
-        self.connected = value
-        if not value:
-            self.status = 'idle'
-        elif changed:
-            self.last_speed = None
-            self.last_hit = None
-            self.last_tokens = None
-            self.refresh_active()
-            self.refresh_target()
-            self.sync_last_message()
-
-    def on_execution(self, sid, kind):
-        if self.pinned_sid and sid != self.pinned_sid:
-            return
-        if kind == 'started':
+    def dispatch(self, kind, param, extra):
+        if kind == 'connected':
+            changed = self.connected != bool(extra)
+            self.connected = bool(extra)
+            if not self.connected:
+                self.status = 'idle'
+            elif changed:
+                self.reset_stats()
+                self.apiq.put(('refresh-all', None, None))
+        elif kind == 'active-list':
+            self.active_sids = param or frozenset()
+            if self.target_sid not in self.active_sids and self.status == 'running':
+                self.status = 'idle'
+        elif kind == 'session-list':
+            self.recent = param or []
+            self.session_titles = extra or {}
+            self.apply_target()
+        elif kind == 'target-stats':
+            sid, data = param, extra
             if sid != self.target_sid:
-                self.target_sid = sid
-                self.refresh_active()
-                self.sync_last_message()
                 return
-            self.status = 'running'
-        elif self.target_sid == sid and kind in ('succeeded', 'failed', 'interrupted'):
-            self.status = 'idle'
-        self.render()
+            title = data.get('title')
+            if title and title != 'no title':
+                self.session_titles[sid] = title
+            stat = data.get('stat') or {}
+            if stat.get('speed') is not None or stat.get('tokens'):
+                self.apply_stats(stat)
+            self.current_model = data.get('model') or self.current_model
+            if data.get('running'):
+                self.status = 'running'
+        elif kind == 'step-stats':
+            sid, data = param, extra
+            if sid != self.target_sid:
+                return
+            self.apply_stats(data)
+        elif kind == 'execution':
+            self.on_execution(param, extra)
 
-    def on_step_started(self, sid, mid):
-        if self.pinned_sid and sid != self.pinned_sid:
+    def on_execution(self, sid, sub):
+        if sub == 'started':
+            if self.pinned_sid and sid != self.pinned_sid:
+                return
+            self.switch_target(sid)
+            self.status = 'running'
+        elif self.target_sid == sid and sub in ('succeeded', 'failed', 'interrupted'):
+            self.status = 'idle'
+
+    def switch_target(self, sid):
+        if not sid:
             return
         if sid != self.target_sid:
             self.target_sid = sid
-            self.refresh_active()
-            self.sync_last_message()
-            return
-        self.status = 'running'
-        self.render()
+            self.reset_stats()
+        self.apiq.put(('target-sync', sid, None))
 
-    def on_step_ended(self, sid, mid):
-        if sid != self.target_sid:
-            return
-        try:
-            message = self.service.message_detail(sid, mid)
-        except ServiceError:
-            return
-        self.apply_message(message)
-        self.status = 'idle'
-        self.render()
-
-    def refresh_active(self):
-        try:
-            self.active_sids = frozenset(self.service.active_sessions())
-        except ServiceError:
-            self.active_sids = frozenset()
-
-    def refresh_target(self):
-        try:
-            sessions = self.service.recent_sessions()
-        except ServiceError:
-            sessions = []
-        self.recent = []
-        self.session_titles = {}
-        for session in sessions:
-            sid = session.get('id')
-            if not sid:
-                continue
-            title = session.get('title') or 'no title'
-            self.recent.append((sid, title, sid in self.active_sids))
-            self.session_titles[sid] = title
+    def apply_target(self):
         if self.pinned_sid:
+            sid = self.pinned_sid
+        elif self.target_sid and self.target_sid in self.active_sids:
+            sid = self.target_sid
+        elif self.active_sids:
+            candidates = [sid for sid, title, running in self.recent
+                          if sid in self.active_sids]
+            sid = candidates[0] if candidates else self.target_sid
+        elif self.target_sid:
+            sid = self.target_sid
+        elif self.recent:
+            sid = self.recent[0][0]
+        else:
             return
-        if self.active_sids:
-            if self.target_sid not in self.active_sids:
-                for sid, title, running in self.recent:
-                    if sid in self.active_sids:
-                        self.target_sid = sid
-                        self.sync_last_message()
-                        break
-        elif self.target_sid is None and self.recent:
-            self.target_sid = self.recent[0][0]
-            self.sync_last_message()
+        self.switch_target(sid)
 
-    def sync_last_message(self):
-        if not self.target_sid:
-            return
-        try:
-            info = self.service.session_info(self.target_sid)
-            self.current_model = info.get('model') or self.current_model
-            messages = self.service.session_messages(self.target_sid)
-        except ServiceError:
-            return
+    def reset_stats(self):
         self.last_tokens = None
         self.last_hit = None
         self.last_speed = None
-        checked = 0
-        for message in messages:
-            if message.get('type') != 'assistant' or not message.get('id'):
-                continue
-            if checked >= 5:
-                break
-            checked += 1
-            try:
-                detail = self.service.message_detail(self.target_sid, message['id'])
-            except ServiceError:
-                continue
-            if detail.get('tokens'):
-                self.apply_message(detail)
-                break
-        self.status = 'running' if self.target_sid in self.active_sids else 'idle'
-        self.render()
+        self.last_seconds = None
+        self.current_model = None
 
-    def apply_message(self, message):
-        info = message.get('time') or {}
-        tokens = message.get('tokens')
-        self.last_tokens = tokens if tokens else None
-        self.last_hit = calc_hit(tokens)
-        self.last_speed = calc_speed(tokens, info.get('streamed'), info.get('completed'))
-        self.current_model = message.get('model') or self.current_model
-        self.render()
+    def apply_stats(self, data):
+        self.last_tokens = data.get('tokens')
+        self.last_hit = data.get('hit')
+        self.last_speed = data.get('speed')
+        self.last_seconds = data.get('seconds')
+        self.current_model = data.get('model') or self.current_model
 
     def render(self):
         if not self.connected:
@@ -462,7 +496,7 @@ class App:
         else:
             text, color = '待機', '#9a9a9a'
         self.status_label.config(text=text, fg=color)
-        self.speed_label.config(text=fmt_speed(self.last_speed))
+        self.speed_label.config(text=fmt_speed(self.last_speed, self.last_seconds))
         self.hit_label.config(text='cache hit: ' + fmt_hit(self.last_hit))
         if self.last_tokens:
             cache = self.last_tokens.get('cache') or {}
