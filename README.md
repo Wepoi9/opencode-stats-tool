@@ -16,7 +16,7 @@ python opencode_stats.py
 
 ## 表示内容
 
-- 実行状態: 未接続 / 生成中 / 待機。生成中判定は `session.execution.started` イベントと
+- 実行状態: 未接続 / 生成中 / 待機。生成中かどうかは `session.execution.started` イベントと
   `/api/session/active` への実行状態照会に基づく。step 終了だけでは待機に戻さない。
 - 実効速度(tok/s): 同一セッション・同一モデルの直近 10 回の加重平均
   `Σ(output + reasoning) / Σ(streamed - created)`。
@@ -25,8 +25,8 @@ python opencode_stats.py
   - 生成途中やトークンを持たないメッセージ、経過 0.05 秒未満・600 秒超の応答はサンプルから除外。
   - 起動時・セッション切替・`session.step.ended` ごとに `/api/session/{sid}/message?type=assistant&limit=20&order=desc`
     から履歴を昇順で集計し、最新モデルの正常完了 step を最大 10 件復元する。
-  - 古い応答は `(time.created, メッセージID)` の順比較で集計より先に破棄する。履歴再取得や
-    重複イベントが平均を壊さない。条件は 15 秒ごとの定期再取得でも同様。
+  - 古い応答は `(time.created, メッセージID)` の順で比較し、集計前に破棄する。履歴の再取得や
+    重複イベントによって平均値が変わらない。条件は 15 秒ごとの定期再取得でも同様。
   - モデルまたは対象セッションが変わると平均をリセットする。
 - last 行: 直近 1 step の単発 tok/s と計測区間(応答区間 / 完了区間)。平均との突合・デバッグ用。
 - キャッシュヒット率（累積）：セッションの累積値 `read / (input + read + write) * 100`。
@@ -47,8 +47,8 @@ python opencode_stats.py
 
 - OpenCode 2.0.30 の `/api/event`(SSE) を購読し、起動時・イベント発火時・15 秒ごとの定期取得で
   `/api/session`、`/api/session/{sid}`、`/api/session/{sid}/message`、`/api/session/active` を読み取る。
-  `session.step.ended` では表示対象セッションに限り対象同期(セッション情報 + 最新 20 件履歴)を再実行する。
-  同一対象の未処理同期要求は 1 件だけ登録し、子セッション(サブエージェント)の step では再取得しない。
+  `session.step.ended` では表示対象セッションに限り、同期処理（セッション情報と最新 20 件の履歴の取得）を再実行する。
+  同じ対象への未処理の同期要求は 1 件だけ登録し、子セッション(サブエージェント)の step では再取得しない。
   単一メッセージの詳細取得エンドポイントと再取得タイマーは使用しない。
 - OpenCode には `created`(モデルリクエスト開始) / `streamed`(応答ストリーム終了) / `completed`(後処理込み完了) の
   3 つの時刻がある。`completed - created` はツール実行時間を含むため、速度計測には使わない。
