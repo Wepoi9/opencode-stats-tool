@@ -360,7 +360,7 @@ class App:
         menu.add_command(label='統計を再取得',
                          command=lambda: self.apiq.put(('refresh-all', None, None)))
         menu.add_separator()
-        menu.add_radiobutton(label='自動（実行中セッションを追従）',
+        menu.add_radiobutton(label='自動（実行中のセッションに追従）',
                              variable=self.menu_pin, value='__auto__',
                              command=self.release_pin)
         for sid, title, running, child in self.recent:

@@ -11,8 +11,8 @@ python opencode_stats.py
 ```
 
 - OpenCode Desktop が起動済みの状態で実行する。ツール単体で共有サービスは起動しない。
-- サービス登録は `~/.local/state/opencode/service.json` を読み、認証は Basic(`opencode:<password>`)。
-- 登録ファイルは API リクエストごとに mtime を比較し、変化があれば URL・認証情報を再読込する。
+- サービス情報は `~/.local/state/opencode/service.json` から読み取り、Basic 認証（`opencode:<password>`）を使用する。
+- 登録ファイルの更新時刻を API リクエストごとに確認し、変化があれば URL と認証情報を再読み込みする。
 
 ## 表示内容
 
@@ -29,11 +29,11 @@ python opencode_stats.py
     重複イベントが平均を壊さない。条件は 15 秒ごとの定期再取得でも同様。
   - モデルまたは対象セッションが変わると平均をリセットする。
 - last 行: 直近 1 step の単発 tok/s と計測区間(応答区間 / 完了区間)。平均との突合・デバッグ用。
-- cache hit 率(累積): セッションの累積値 `read / (input + read + write) * 100`。
+- キャッシュヒット率（累積）：セッションの累積値 `read / (input + read + write) * 100`。
   read/write が両方 0 のときは「未計測」。
 - キャッシュ read / write / input トークン数(累積)。いずれも `/api/session/{sid}` の
   セッション累積 `tokens` をそのまま表示し、ツール側で独自に積算しない。
-- 対象モデルと対象セッションのタイトル(補助表示)。セッション切替時は統計をリセットし、前セッションの数値を引き継がない。
+- 対象モデルと対象セッションのタイトル（補助表示）。セッション切り替え時には統計をリセットし、前のセッションの数値を引き継がない。
 
 ## 操作
 
@@ -60,13 +60,13 @@ python opencode_stats.py
 - 実行セッションの追従時は `/api/session/{sid}` の `parentID` を確認し、子セッション(サブエージェント)の
   実行で対象を切り替えない。親セッション優先。固定(ピン)中はピン以外の実行を無視する。
 - event frames は `{"id", "type", "data": {sessionID, ...}}`。15 秒ごとの `: heartbeat` コメント行も破棄する。
-- SSE は live-only。切断時は 2 秒後に再接続し、対象セッションの最新確定値を再取得する。
-- HTTP は標準の urllib.request で、次の制限をかける。
+- SSE は過去のイベントを再配信しない。接続が切れた場合は2秒後に再接続し、対象セッションの直近の確定値を再取得する。
+- HTTP 通信には標準ライブラリの `urllib.request` を使用し、次の制限を設ける。
   - 接続先は `service.json` 登録 URL のうち scheme `http` かつホストがループバック(`localhost` / `127.0.0.1` / `::1`)の場合のみ。それ以外は未登録扱いで停止。
   - リダイレクト禁止(`HTTPRedirectHandler.redirect_request` を常時 None)。
   - プロキシ不使用(空の `ProxyHandler` を登録し、システムプロキシ設定を経由しない)。
 - Tk メインスレッドは描画とキュー投入のみで、HTTP 通信は SSE 読み取りスレッドと API ワーカースレッドで実行する。
 - 401 応答時は URL・認証・mtime キャッシュを破棄し、次回 `service.json` から再読み込みする。
-- 標準ライブラリのみ。外部通信は 127.0.0.1 の既存サービスのみで、Secrets・会話本文を永続保存しない。
+- 標準ライブラリのみを使用する。通信先は既存のローカルサービス（127.0.0.1）に限定し、秘密情報や会話本文を永続保存しない。
 - テスト: `python -m unittest test_opencode_stats`（計測ロジック・集計・API クエリ生成、外部通信なし）。
 - コード量: opencode_stats.py 約 686 行 / test_opencode_stats.py 約 234 行（空行を含む総行数）。
