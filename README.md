@@ -18,6 +18,8 @@ python opencode_stats.py
 
 - 実行状態: 未接続 / 生成中 / 待機。生成中かどうかは `session.execution.started` イベントと
   `/api/session/active` への実行状態照会に基づく。step 終了だけでは待機に戻さない。
+  SSE 接続が維持されたまま統計取得だけが失敗した場合は状態欄に「取得エラー」を表示し、
+  次の正常取得で解除する。表示中の統計が古い可能性を示す。
 - 実効速度(tok/s): 同一セッション・同一モデルの直近 10 回の加重平均
   `Σ(output + reasoning) / Σ(streamed - created)`。
   - 計測区間はモデル応答区間(`time.created` → `time.streamed`)を優先し、ツール実行や後処理を含めない。
@@ -66,7 +68,9 @@ python opencode_stats.py
   - リダイレクト禁止(`HTTPRedirectHandler.redirect_request` を常時 None)。
   - プロキシ不使用(空の `ProxyHandler` を登録し、システムプロキシ設定を経由しない)。
 - Tk メインスレッドは描画とキュー投入のみで、HTTP 通信は SSE 読み取りスレッドと API ワーカースレッドで実行する。
+  対象同期と定期取得の取得結果は 'target-stats' など通常応答として、失敗は 'sync-error' として
+  画面スレッドへ通知し、画面は失敗を「取得エラー」表示にして対象セッションの正常取得で解除する。
 - 401 応答時は URL・認証・mtime キャッシュを破棄し、次回 `service.json` から再読み込みする。
 - 標準ライブラリのみを使用する。通信先は既存のローカルサービス（127.0.0.1）に限定し、秘密情報や会話本文を永続保存しない。
 - テスト: `python -m unittest test_opencode_stats`（計測ロジック・集計・API クエリ生成、外部通信なし）。
-- コード量: opencode_stats.py 約 686 行 / test_opencode_stats.py 約 234 行（空行を含む総行数）。
+- コード量: opencode_stats.py 約 694 行 / test_opencode_stats.py 約 301 行（空行を含む総行数）。

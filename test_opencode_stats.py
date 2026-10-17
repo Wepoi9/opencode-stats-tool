@@ -4,7 +4,7 @@ import unittest
 
 from opencode_stats import (
     calc_speed, calc_hit, calc_stats, message_to_sample,
-    model_key, Aggregation, fmt_speed, Service,
+    model_key, Aggregation, fmt_speed, Service, ServiceError,
 )
 
 
@@ -21,6 +21,28 @@ def message(mid, created=1000, streamed=None, completed=None, output=100,
         time_field['streamed'] = streamed
     return {'id': mid, 'type': 'assistant', 'model': model,
             'tokens': tokens, 'time': time_field}
+
+
+def bare_app(service):
+    """Tk を起動せず、テスト対象の最小状態だけを用意した App を返す。"""
+    from opencode_stats import App, Aggregation
+    app = App.__new__(App)
+    app.q = queue.Queue()
+    app.apiq = queue.Queue()
+    app.pending_syncs = set()
+    app.service = service
+    app.target_sid = 's1'
+    app.session_titles = {}
+    app.target_child = False
+    app.session_tokens = None
+    app.agg = Aggregation()
+    app.status = 'idle'
+    app.stats_error = False
+    app.last_key = None
+    app.last_speed = None
+    app.last_seconds = None
+    app.last_method = None
+    return app
 
 
 class CalcSpeedTests(unittest.TestCase):
@@ -169,15 +191,8 @@ class FmtSpeedTests(unittest.TestCase):
 
 
 class SyncTargetTests(unittest.TestCase):
-    def make_stub(self):
-        from opencode_stats import App
-        app = App.__new__(App)
-        app.pending_syncs = set()
-        app.apiq = queue.Queue()
-        return app
-
     def test_dedupes_pending_requests_for_same_sid(self):
-        app = self.make_stub()
+        app = bare_app(StubService())
         app.sync_target('s1')
         app.sync_target('s1')
         app.sync_target('s2')
@@ -185,18 +200,70 @@ class SyncTargetTests(unittest.TestCase):
         self.assertEqual(app.pending_syncs, {'s1', 's2'})
 
     def test_discarded_on_processing(self):
-        app = self.make_stub()
+        app = bare_app(StubService())
         app.sync_target('s1')
         app.pending_syncs.discard('s1')
         app.sync_target('s1')
         self.assertEqual(app.apiq.qsize(), 2)
 
     def test_ignores_invalid_sid(self):
-        app = self.make_stub()
+        app = bare_app(StubService())
         app.sync_target(None)
         app.sync_target('')
         self.assertEqual(app.apiq.qsize(), 0)
         self.assertEqual(app.pending_syncs, set())
+
+
+class SyncErrorTests(unittest.TestCase):
+    def test_failed_sync_reports_error(self):
+        app = bare_app(StubService(fail=True))
+        app.run_job('target-sync', 's1')
+        kind, _, _ = app.q.get_nowait()
+        self.assertEqual(kind, 'sync-error')
+        self.assertTrue(app.q.empty())
+
+    def test_failed_refresh_reports_error(self):
+        app = bare_app(StubService(fail=True))
+        app.run_job('refresh-all', None)
+        kind, _, _ = app.q.get_nowait()
+        self.assertEqual(kind, 'sync-error')
+
+    def test_successful_sync_does_not_report(self):
+        app = bare_app(StubService())
+        app.run_job('target-sync', 's1')
+        kind, param, _ = app.q.get_nowait()
+        self.assertEqual(kind, 'target-stats')
+        self.assertEqual(param, 's1')
+        self.assertTrue(app.q.empty())
+
+    def test_error_state_roundtrip(self):
+        app = bare_app(StubService())
+        app.stats_error = True
+        app.dispatch('sync-error', None, None)
+        self.assertTrue(app.stats_error)
+        info = {'title': 't', 'messages': []}
+        app.on_target_stats('s2', info)
+        self.assertTrue(app.stats_error)
+        app.on_target_stats('s1', info)
+        self.assertFalse(app.stats_error)
+
+
+class StubService:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def session_info(self, sid):
+        if self.fail:
+            raise ServiceError('HTTP 500')
+        return {'title': 't', 'tokens': None}
+
+    def session_messages(self, sid):
+        return []
+
+    def active_sessions(self):
+        if self.fail:
+            raise ServiceError('HTTP 500')
+        return []
 
 
 class ServiceTests(unittest.TestCase):

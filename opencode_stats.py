@@ -320,6 +320,7 @@ class App:
         self.last_key = None
         self.session_titles = {}
         self.pending_syncs = set()
+        self.stats_error = False
 
         self.root = tk.Tk()
         self.root.title('OpenCode 統計')
@@ -463,7 +464,7 @@ class App:
             elif kind == 'execution-check':
                 self.job_execution_check(sid)
         except Exception:
-            pass
+            self.q.put(('sync-error', None, None))
 
     def job_refresh_all(self):
         active = self.service.active_sessions()
@@ -536,10 +537,13 @@ class App:
             self.adopt_running_target(param)
         elif kind == 'execution':
             self.on_execution(param, extra)
+        elif kind == 'sync-error':
+            self.stats_error = True
 
     def on_target_stats(self, sid, data):
         if sid != self.target_sid:
             return
+        self.stats_error = False
         title = data.get('title')
         if title and title != 'no title':
             self.session_titles[sid] = title
@@ -629,6 +633,7 @@ class App:
         self.last_seconds = None
         self.last_method = None
         self.last_key = None
+        self.stats_error = False
 
     def render(self):
         if not self.connected:
@@ -637,6 +642,9 @@ class App:
             text, color = '生成中', '#5ad469'
         else:
             text, color = '待機', '#9a9a9a'
+        if self.connected and self.stats_error:
+            text += ' 取得エラー'
+            color = '#e8b46a'
         self.status_label.config(text=text, fg=color)
         avg = self.agg.average()
         if avg is not None:
