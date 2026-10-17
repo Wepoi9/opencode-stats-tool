@@ -23,12 +23,16 @@ python opencode_stats.py
   - 計測区間はモデル応答区間(`time.created` → `time.streamed`)を優先し、ツール実行や後処理を含めない。
   - `streamed` を持たない応答は平均に混ぜず、直近 1 回の `(completed - created)` 基準の値を参考値(橙色表示)として扱う。
   - 生成途中やトークンを持たないメッセージ、経過 0.05 秒未満・600 秒超の応答はサンプルから除外。
-  - 起動時・セッション切替時に `/api/session/{sid}/message?type=assistant&limit=20&order=desc` から
-    過去の正常完了 step を最大 10 件取得して平均を復元する。
+  - 起動時・セッション切替・`session.step.ended` ごとに `/api/session/{sid}/message?type=assistant&limit=20&order=desc`
+    から履歴を昇順で集計し、最新モデルの正常完了 step を最大 10 件復元する。
+  - 古い応答は `(time.created, メッセージID)` の順比較で集計より先に破棄する。履歴再取得や
+    重複イベントが平均を壊さない。条件は 15 秒ごとの定期再取得でも同様。
   - モデルまたは対象セッションが変わると平均をリセットする。
 - last 行: 直近 1 step の単発 tok/s と計測区間(応答区間 / 完了区間)。平均との突合・デバッグ用。
-- cache hit 率(直近 1 回): `read / (input + read + write) * 100`。read/write が両方 0 のときは「未計測」。
-- キャッシュ read / write / input トークン数(直近 1 回)。キャッシュ統計は平均せず常に最新 1 step の値。
+- cache hit 率(累積): セッションの累積値 `read / (input + read + write) * 100`。
+  read/write が両方 0 のときは「未計測」。
+- キャッシュ read / write / input トークン数(累積)。いずれも `/api/session/{sid}` の
+  セッション累積 `tokens` をそのまま表示し、ツール側で独自に積算しない。
 - 対象モデルと対象セッションのタイトル(補助表示)。セッション切替時は統計をリセットし、前セッションの数値を引き継がない。
 
 ## 操作
@@ -41,15 +45,17 @@ python opencode_stats.py
 
 ## 実装メモ
 
-- OpenCode 2.0.30 の `/api/event`(SSE) を購読し、起動時とイベント発火時に `/api/session`、`/api/session/{sid}`、
-  `/api/session/{sid}/message`、`/api/session/{sid}/message/{mid}`、`/api/session/active` を読み取る。
-  統計は `session.step.ended` 発火時に該当メッセージ詳細から再計算する。
+- OpenCode 2.0.30 の `/api/event`(SSE) を購読し、起動時・イベント発火時・15 秒ごとの定期取得で
+  `/api/session`、`/api/session/{sid}`、`/api/session/{sid}/message`、`/api/session/active` を読み取る。
+  `session.step.ended` では該当セッションの対象同期(セッション情報 + 最新 20 件履歴)を再実行する。
+  単一メッセージの詳細取得エンドポイントと再取得タイマーは使用しない。
 - OpenCode には `created`(モデルリクエスト開始) / `streamed`(応答ストリーム終了) / `completed`(後処理込み完了) の
   3 つの時刻がある。`completed - created` はツール実行時間を含むため、速度計測には使わない。
 - セッション一覧とメッセージ取得は API 側に `limit` / `order` / `type` を指定し、全件取得しない。
   メッセージは `type=assistant&limit=20&order=desc` で最新 20 件のみ。
-- 同一 step の重複取得と、より新しい結果を既に表示している場合の古い結果の適用は、
-  メッセージ ID と `time.created` の順序比較で除外する。15 秒ごとの定期取得が表示を後退させない。
+- 集計はメッセージ ID と `time.created` の順序比較で重複と古い応答を除外する。
+  履歴が複数モデルを含む場合、昇順の通過で新しいモデルに到達した時点で平均をリセットし、
+  最終状態は最新モデルの記録のみになる。
 - 実行セッションの追従時は `/api/session/{sid}` の `parentID` を確認し、子セッション(サブエージェント)の
   実行で対象を切り替えない。親セッション優先。固定(ピン)中はピン以外の実行を無視する。
 - event frames は `{"id", "type", "data": {sessionID, ...}}`。15 秒ごとの `: heartbeat` コメント行も破棄する。
@@ -62,4 +68,4 @@ python opencode_stats.py
 - 401 応答時は URL・認証・mtime キャッシュを破棄し、次回 `service.json` から再読み込みする。
 - 標準ライブラリのみ。外部通信は 127.0.0.1 の既存サービスのみで、Secrets・会話本文を永続保存しない。
 - テスト: `python -m unittest test_opencode_stats`（計測ロジック・集計・API クエリ生成、外部通信なし）。
-- コード量: opencode_stats.py 約 633 行 / test_opencode_stats.py 約 160 行（空行を含む総行数）。
+- コード量: opencode_stats.py 約 674 行 / test_opencode_stats.py 約 202 行（空行を含む総行数）。

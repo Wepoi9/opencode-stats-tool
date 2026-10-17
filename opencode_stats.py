@@ -65,35 +65,22 @@ def calc_hit(tokens):
 
 
 def calc_stats(message):
+    """表示のため 1 メッセージの実効速度情報を取り出す。"""
     info = message.get('time') or {}
-    tokens = message.get('tokens')
-    speed, seconds, method = calc_speed(tokens, info.get('created'),
+    speed, seconds, method = calc_speed(message.get('tokens'), info.get('created'),
                                         info.get('streamed'), info.get('completed'))
     created = info.get('created')
-    mid = message.get('id') or ''
     return {
-        'key': (created if isinstance(created, (int, float)) else 0, mid),
-        'tokens': tokens if tokens else None,
-        'hit': calc_hit(tokens),
+        'key': (created if isinstance(created, (int, float)) else 0, message.get('id') or ''),
         'speed': speed,
         'seconds': seconds,
         'method': method,
-        'model': message.get('model'),
     }
 
 
 def is_completed(message):
     info = message.get('time') or {}
     return bool(info.get('completed')) and bool(message.get('tokens'))
-
-
-def find_completed(messages):
-    for message in messages:
-        if message.get('type') != 'assistant' or not message.get('id'):
-            continue
-        if is_completed(message):
-            return message
-    return None
 
 
 def model_key(model):
@@ -120,37 +107,55 @@ def message_to_sample(message):
 
 
 class Aggregation:
-    """同一セッション・同一モデルの直近10サンプル加重平均を管理する。
+    """同一セッション・同一モデルの直近10サンプルの加重平均を管理する。
 
     samples は (created, mid, 出力トークン, 秒数) の昇順リスト。
+    古い応答は (created, mid) 順比較で破棄し、集計状態を一切変更しないため、
+    古いイベントや履歴の再取得が平均を壊さない。
     """
 
     def __init__(self):
         self.model = None
         self.model_obj = None
         self.samples = []
+        self.newest_key = None
 
     def clear(self):
         self.model = None
         self.model_obj = None
         self.samples = []
+        self.newest_key = None
 
-    def add_message(self, message):
-        if not isinstance(message, dict):
+    def update(self, message):
+        """1メッセージを取込む。戻り値は集計状態が前進したかどうか。
+
+        メッセージIDと時刻で重複と古い応答を破棄する。新しい応答で実際の
+        モデルが変わった場合だけ平均をリセットする。履歴は昇順で渡すこと。
+        """
+        info = message.get('time') or {}
+        created = info.get('created')
+        mid = message.get('id')
+        if not isinstance(created, (int, float)) \
+                or not isinstance(mid, str) or not mid:
             return False
-        key = model_key(message.get('model'))
-        if key is None:
+        key = (created, mid)
+        if self.newest_key is not None and key < self.newest_key:
             return False
-        changed = False
-        if key != self.model:
-            self.model = key
+        key_model = model_key(message.get('model'))
+        if key_model is None:
+            return False
+        previous = self.newest_key
+        self.newest_key = key
+        changed = previous != key
+        if key_model != self.model:
+            self.model = key_model
             self.model_obj = message.get('model')
             self.samples = []
             changed = True
         sample = message_to_sample(message)
-        if sample is None:
-            return changed
-        return self.add_sample(sample) or changed
+        if sample is not None and self.add_sample(sample):
+            changed = True
+        return changed
 
     def add_sample(self, sample):
         for existing in self.samples:
@@ -285,9 +290,6 @@ class Service:
         return self.get('/api/session/%s/message?type=assistant&limit=20&order=desc'
                         % sid).get('data') or []
 
-    def message_detail(self, sid, mid):
-        return self.get('/api/session/%s/message/%s' % (sid, mid)).get('data') or {}
-
     def active_sessions(self):
         data = self.get('/api/session/active').get('data')
         return list(data) if isinstance(data, dict) else []
@@ -311,18 +313,12 @@ class App:
         self.connected = False
         self.status = 'idle'
         self.agg = Aggregation()
-        self.speed_avg = None
-        self.avg_usage = None
-        self.fallback_speed = None
+        self.session_tokens = None
         self.last_speed = None
         self.last_seconds = None
         self.last_method = None
         self.last_key = None
-        self.last_hit = None
-        self.last_tokens = None
-        self.current_model = None
         self.session_titles = {}
-        self.step_retry = {}
 
         self.root = tk.Tk()
         self.root.title('OpenCode 統計')
@@ -347,7 +343,7 @@ class App:
         self.status_label = label(9, 'bold', '#9a9a9a', '未接続')
         self.speed_label = label(17, 'bold', '#7ec8ff', '計測不可')
         self.usage_label = label(8, 'normal', '#9a9a9a', '')
-        self.hit_label = label(9, 'normal', '#e2e2e2', 'cache hit(直近1回): 未計測')
+        self.hit_label = label(9, 'normal', '#e2e2e2', 'cache hit(累積): 未計測')
         self.cache_label = label(9, 'normal', '#e2e2e2', 'read: -  write: -  input: -')
         self.last_label = label(8, 'normal', '#9a9a9a', 'last: -')
         self.model_label = label(8, 'normal', '#9a9a9a', 'model: -')
@@ -439,35 +435,33 @@ class App:
         if kind.startswith('session.execution.'):
             self.q.put(('execution', sid, kind.rsplit('.', 1)[-1]))
         elif kind == 'session.step.ended':
-            mid = data.get('assistantMessageID')
-            if mid:
-                self.apiq.put(('step-detail', sid, mid))
+            self.apiq.put(('target-sync', sid, None))
 
     def api_worker(self):
         last_refresh = 0.0
         while self.running:
             try:
-                kind, sid, mid = self.apiq.get(timeout=1.0)
-                if kind == 'refresh-all':
-                    last_refresh = time.time()
-                    self.job_refresh_all()
-                elif kind == 'target-sync':
-                    self.job_target_sync(sid)
-                elif kind == 'step-detail':
-                    self.job_step_detail(sid, mid)
-                elif kind == 'execution-check':
-                    self.job_execution_check(sid)
+                kind, sid, _ = self.apiq.get(timeout=1.0)
             except queue.Empty:
                 now = time.time()
                 if self.connected and now - last_refresh >= 15.0:
                     last_refresh = now
-                    try:
-                        self.job_refresh_all()
-                    except Exception:
-                        self.q.put(('connected', None, False))
+                    self.run_job('refresh-all', None)
                 continue
-            except Exception:
-                self.q.put(('connected', None, False))
+            if kind == 'refresh-all':
+                last_refresh = time.time()
+            self.run_job(kind, sid)
+
+    def run_job(self, kind, sid):
+        try:
+            if kind == 'refresh-all':
+                self.job_refresh_all()
+            elif kind == 'target-sync':
+                self.job_target_sync(sid)
+            elif kind == 'execution-check':
+                self.job_execution_check(sid)
+        except Exception:
+            pass
 
     def job_refresh_all(self):
         active = self.service.active_sessions()
@@ -485,37 +479,15 @@ class App:
 
     def job_target_sync(self, sid):
         info = self.service.session_info(sid)
-        title = info.get('title') or 'no title'
         messages = self.service.session_messages(sid)
-        stat = calc_stats(find_completed(messages) or {})
         ordered = list(reversed(messages))
         self.q.put(('target-stats', sid, {
-            'title': title,
-            'stat': stat,
+            'title': info.get('title') or 'no title',
             'messages': ordered,
-            'model': stat.get('model') or info.get('model'),
+            'tokens': info.get('tokens'),
             'running': sid in self.service.active_sessions(),
             'child': bool(info.get('parentID')),
         }))
-
-    def job_step_detail(self, sid, mid):
-        key = (sid, mid)
-        try:
-            detail = self.service.message_detail(sid, mid)
-        except Exception:
-            detail = None
-        if not is_completed(detail):
-            attempts = self.step_retry.get(key, 0) + 1
-            self.step_retry[key] = attempts
-            if attempts <= 3:
-                timer = threading.Timer(1.5, lambda: self.apiq.put(('step-detail', sid, mid)))
-                timer.daemon = True
-                timer.start()
-            else:
-                self.step_retry.pop(key, None)
-            return
-        self.step_retry.pop(key, None)
-        self.q.put(('step-stats', sid, detail))
 
     def job_execution_check(self, sid):
         try:
@@ -558,8 +530,6 @@ class App:
             self.apply_target()
         elif kind == 'target-stats':
             self.on_target_stats(param, extra)
-        elif kind == 'step-stats':
-            self.on_step_stats(param, extra)
         elif kind == 'execution-target':
             sid = param
             if self.pinned_sid and sid != self.pinned_sid:
@@ -576,23 +546,28 @@ class App:
         if title and title != 'no title':
             self.session_titles[sid] = title
         self.target_child = bool(data.get('child'))
-        model = data.get('model')
-        self.current_model = model or self.current_model
-        for message in data.get('messages') or []:
-            self.agg.add_message(message)
-        self.speed_avg = self.agg.average()
-        self.avg_usage = self.agg.usage()
-        stat = data.get('stat') or {}
-        if stat.get('speed') is not None or stat.get('tokens'):
-            self.apply_stats(stat, model)
+        tokens = data.get('tokens')
+        if tokens:
+            self.session_tokens = tokens
+        self.ingest(data.get('messages') or [])
         if data.get('running'):
             self.status = 'running'
 
-    def on_step_stats(self, sid, message):
-        if sid != self.target_sid:
+    def ingest(self, messages):
+        """昇順のメッセージを集計へ取込み、最新確定値の表示を更新する。"""
+        for message in messages:
+            if self.agg.update(message) and is_completed(message):
+                self.apply_last(message)
+
+    def apply_last(self, message):
+        stat = calc_stats(message)
+        key = stat['key']
+        if self.last_key is not None and key < self.last_key:
             return
-        self.agg.add_message(message)
-        self.apply_stats(calc_stats(message), message.get('model'))
+        self.last_key = key
+        self.last_speed = stat['speed']
+        self.last_seconds = stat['seconds']
+        self.last_method = stat['method']
 
     def on_execution(self, sid, sub):
         if sub == 'started':
@@ -634,38 +609,11 @@ class App:
 
     def reset_stats(self):
         self.agg.clear()
-        self.speed_avg = None
-        self.avg_usage = None
-        self.fallback_speed = None
+        self.session_tokens = None
         self.last_speed = None
         self.last_seconds = None
         self.last_method = None
         self.last_key = None
-        self.last_hit = None
-        self.last_tokens = None
-        self.current_model = None
-
-    def apply_stats(self, data, default_model=None):
-        if not data.get('tokens') and data.get('speed') is None:
-            return
-        key = data.get('key') or (0, '')
-        if self.last_key is not None and key < self.last_key:
-            return
-        self.last_key = key
-        if data.get('tokens'):
-            self.last_tokens = data['tokens']
-            self.last_hit = data.get('hit')
-        self.last_speed = data.get('speed')
-        self.last_seconds = data.get('seconds')
-        self.last_method = data.get('method')
-        self.current_model = data.get('model') or default_model or self.current_model
-        self.speed_avg = self.agg.average()
-        self.avg_usage = self.agg.usage()
-        if self.speed_avg is None and data.get('method') == 'fallback' \
-                and data.get('speed') is not None:
-            self.fallback_speed = data['speed']
-        else:
-            self.fallback_speed = None
 
     def render(self):
         if not self.connected:
@@ -675,23 +623,26 @@ class App:
         else:
             text, color = '待機', '#9a9a9a'
         self.status_label.config(text=text, fg=color)
-        if self.speed_avg is not None:
-            self.speed_label.config(text=fmt_speed(self.speed_avg), fg='#7ec8ff')
-            self.usage_label.config(text=self.avg_usage or '', fg='#9a9a9a')
-        elif self.fallback_speed is not None:
-            self.speed_label.config(text=fmt_speed(self.fallback_speed), fg='#e8b46a')
+        avg = self.agg.average()
+        if avg is not None:
+            self.speed_label.config(text=fmt_speed(avg), fg='#7ec8ff')
+            self.usage_label.config(text=self.agg.usage() or '', fg='#9a9a9a')
+        elif self.last_method == 'fallback' and self.last_speed is not None:
+            self.speed_label.config(text=fmt_speed(self.last_speed), fg='#e8b46a')
             self.usage_label.config(text='参考値(直近1回・完了までの実測)', fg='#e8b46a')
         else:
             self.speed_label.config(text='計測不可', fg='#9a9a9a')
             self.usage_label.config(text='', fg='#9a9a9a')
-        self.hit_label.config(text='cache hit(直近1回): ' + fmt_hit(self.last_hit))
-        if self.last_tokens:
-            cache = self.last_tokens.get('cache') or {}
+        tokens = self.session_tokens
+        if tokens:
+            cache = tokens.get('cache') or {}
+            self.hit_label.config(text='cache hit(累積): ' + fmt_hit(calc_hit(tokens)))
             self.cache_label.config(text='read: %s  write: %s  input: %s' % (
                 fmt_tok(cache.get('read', 0) or 0),
                 fmt_tok(cache.get('write', 0) or 0),
-                fmt_tok(self.last_tokens.get('input', 0) or 0)))
+                fmt_tok(tokens.get('input', 0) or 0)))
         else:
+            self.hit_label.config(text='cache hit(累積): 未計測')
             self.cache_label.config(text='read: -  write: -  input: -')
         if self.last_speed is not None and self.last_seconds is not None:
             mode = '応答区間' if self.last_method == 'measured' else '完了区間'
@@ -699,7 +650,7 @@ class App:
                 self.last_speed, mode, self.last_seconds))
         else:
             self.last_label.config(text='last: -')
-        self.model_label.config(text='model: ' + fmt_model(self.current_model))
+        self.model_label.config(text='model: ' + fmt_model(self.agg.model_obj))
         sid = self.target_sid
         title = self.session_titles.get(sid) if sid else None
         label = title if title else (sid or '-')
