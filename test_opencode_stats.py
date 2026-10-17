@@ -1,4 +1,5 @@
 """opencode_stats.py の計測ロジックに対する unittest。外部通信なし。"""
+import queue
 import unittest
 
 from opencode_stats import (
@@ -165,6 +166,37 @@ class FmtSpeedTests(unittest.TestCase):
         self.assertEqual(fmt_speed(None), '計測不可')
         self.assertEqual(fmt_speed(82.44), '82.4 tok/s')
         self.assertEqual(fmt_speed(1200.0), '1.2K tok/s')
+
+
+class SyncTargetTests(unittest.TestCase):
+    def make_stub(self):
+        from opencode_stats import App
+        app = App.__new__(App)
+        app.pending_syncs = set()
+        app.apiq = queue.Queue()
+        return app
+
+    def test_dedupes_pending_requests_for_same_sid(self):
+        app = self.make_stub()
+        app.sync_target('s1')
+        app.sync_target('s1')
+        app.sync_target('s2')
+        self.assertEqual(app.apiq.qsize(), 2)
+        self.assertEqual(app.pending_syncs, {'s1', 's2'})
+
+    def test_discarded_on_processing(self):
+        app = self.make_stub()
+        app.sync_target('s1')
+        app.pending_syncs.discard('s1')
+        app.sync_target('s1')
+        self.assertEqual(app.apiq.qsize(), 2)
+
+    def test_ignores_invalid_sid(self):
+        app = self.make_stub()
+        app.sync_target(None)
+        app.sync_target('')
+        self.assertEqual(app.apiq.qsize(), 0)
+        self.assertEqual(app.pending_syncs, set())
 
 
 class ServiceTests(unittest.TestCase):

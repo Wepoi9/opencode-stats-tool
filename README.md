@@ -47,7 +47,8 @@ python opencode_stats.py
 
 - OpenCode 2.0.30 の `/api/event`(SSE) を購読し、起動時・イベント発火時・15 秒ごとの定期取得で
   `/api/session`、`/api/session/{sid}`、`/api/session/{sid}/message`、`/api/session/active` を読み取る。
-  `session.step.ended` では該当セッションの対象同期(セッション情報 + 最新 20 件履歴)を再実行する。
+  `session.step.ended` では表示対象セッションに限り対象同期(セッション情報 + 最新 20 件履歴)を再実行する。
+  同一対象の未処理同期要求は 1 件だけ登録し、子セッション(サブエージェント)の step では再取得しない。
   単一メッセージの詳細取得エンドポイントと再取得タイマーは使用しない。
 - OpenCode には `created`(モデルリクエスト開始) / `streamed`(応答ストリーム終了) / `completed`(後処理込み完了) の
   3 つの時刻がある。`completed - created` はツール実行時間を含むため、速度計測には使わない。
@@ -68,4 +69,4 @@ python opencode_stats.py
 - 401 応答時は URL・認証・mtime キャッシュを破棄し、次回 `service.json` から再読み込みする。
 - 標準ライブラリのみ。外部通信は 127.0.0.1 の既存サービスのみで、Secrets・会話本文を永続保存しない。
 - テスト: `python -m unittest test_opencode_stats`（計測ロジック・集計・API クエリ生成、外部通信なし）。
-- コード量: opencode_stats.py 約 674 行 / test_opencode_stats.py 約 202 行（空行を含む総行数）。
+- コード量: opencode_stats.py 約 686 行 / test_opencode_stats.py 約 234 行（空行を含む総行数）。

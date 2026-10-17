@@ -319,6 +319,7 @@ class App:
         self.last_method = None
         self.last_key = None
         self.session_titles = {}
+        self.pending_syncs = set()
 
         self.root = tk.Tk()
         self.root.title('OpenCode 統計')
@@ -380,7 +381,7 @@ class App:
 
     def pin_session(self, sid):
         self.pinned_sid = sid
-        self.switch_target(sid)
+        self.change_or_refresh(sid)
 
     def release_pin(self):
         self.pinned_sid = None
@@ -434,8 +435,8 @@ class App:
             return
         if kind.startswith('session.execution.'):
             self.q.put(('execution', sid, kind.rsplit('.', 1)[-1]))
-        elif kind == 'session.step.ended':
-            self.apiq.put(('target-sync', sid, None))
+        elif kind == 'session.step.ended' and sid == self.target_sid:
+            self.sync_target(sid)
 
     def api_worker(self):
         last_refresh = 0.0
@@ -457,6 +458,7 @@ class App:
             if kind == 'refresh-all':
                 self.job_refresh_all()
             elif kind == 'target-sync':
+                self.pending_syncs.discard(sid)
                 self.job_target_sync(sid)
             elif kind == 'execution-check':
                 self.job_execution_check(sid)
@@ -531,11 +533,7 @@ class App:
         elif kind == 'target-stats':
             self.on_target_stats(param, extra)
         elif kind == 'execution-target':
-            sid = param
-            if self.pinned_sid and sid != self.pinned_sid:
-                return
-            self.switch_target(sid)
-            self.status = 'running'
+            self.adopt_running_target(param)
         elif kind == 'execution':
             self.on_execution(param, extra)
 
@@ -571,24 +569,41 @@ class App:
 
     def on_execution(self, sid, sub):
         if sub == 'started':
-            if self.pinned_sid and sid != self.pinned_sid:
-                return
-            if sid != self.target_sid:
+            if sid == self.target_sid:
+                self.adopt_running_target(sid)
+            elif not self.pinned_sid or sid == self.pinned_sid:
                 self.apiq.put(('execution-check', sid, None))
-                return
-            self.switch_target(sid)
-            self.status = 'running'
         elif self.target_sid == sid and sub in ('succeeded', 'failed', 'interrupted'):
             self.status = 'idle'
 
-    def switch_target(self, sid):
-        if not sid:
+    def sync_target(self, sid):
+        """対象セッションの同期要求を登録する。未処理の同一要求は1件にまとめる。"""
+        if not sid or sid in self.pending_syncs:
             return
-        if sid != self.target_sid:
-            self.target_sid = sid
-            self.target_child = False
-            self.reset_stats()
+        self.pending_syncs.add(sid)
         self.apiq.put(('target-sync', sid, None))
+
+    def switch_target(self, sid):
+        """別セッションへ表示対象を切り替える。同一対象・無効値は無視する。"""
+        if not sid or sid == self.target_sid:
+            return False
+        self.target_sid = sid
+        self.target_child = False
+        self.reset_stats()
+        self.sync_target(sid)
+        return True
+
+    def change_or_refresh(self, sid):
+        """対象が変われば切替し、同じなら統計を即再取得する。"""
+        if not self.switch_target(sid):
+            self.sync_target(sid)
+
+    def adopt_running_target(self, sid):
+        """実行中セッションを表示対象に採用する。同一対象なら即再取得する。"""
+        if self.pinned_sid and sid != self.pinned_sid:
+            return
+        self.change_or_refresh(sid)
+        self.status = 'running'
 
     def apply_target(self):
         if self.pinned_sid:
@@ -605,7 +620,7 @@ class App:
             sid = self.recent[0][0]
         else:
             return
-        self.switch_target(sid)
+        self.change_or_refresh(sid)
 
     def reset_stats(self):
         self.agg.clear()
