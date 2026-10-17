@@ -14,7 +14,7 @@ BASIC_USER = 'opencode'
 LOOPBACK_HOSTS = frozenset(('localhost', '127.0.0.1', '::1'))
 SPEED_MIN_SECONDS = 0.05
 SPEED_MAX_SECONDS = 600.0
-SCAN_LIMIT = 5
+AVG_SAMPLES = 10
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -29,14 +29,27 @@ class ServiceError(Exception):
     pass
 
 
-def calc_speed(tokens, created, completed):
-    if tokens is None or not isinstance(created, (int, float)) or not isinstance(completed, (int, float)):
-        return None, None
-    seconds = (completed - created) / 1000.0
+def calc_speed(tokens, created, streamed, completed):
+    """モデル応答区間 created→streamed を優先して計測する。
+
+    streamed を持たない応答だけ completed にフォールバックし、方式を
+    'measured' / 'fallback' で返す。二つの方式の数値を同じ平均に混ぜない。
+    """
+    if tokens is None or not isinstance(created, (int, float)):
+        return None, None, None
     total = (tokens.get('output', 0) or 0) + (tokens.get('reasoning', 0) or 0)
-    if total <= 0 or seconds < SPEED_MIN_SECONDS or seconds > SPEED_MAX_SECONDS:
-        return None, None
-    return total / seconds, seconds
+    if total <= 0:
+        return None, None, None
+    candidates = []
+    if isinstance(streamed, (int, float)) and streamed >= created:
+        candidates.append((streamed, 'measured'))
+    if isinstance(completed, (int, float)) and completed >= created:
+        candidates.append((completed, 'fallback'))
+    for end, method in candidates:
+        seconds = (end - created) / 1000.0
+        if SPEED_MIN_SECONDS <= seconds <= SPEED_MAX_SECONDS:
+            return total / seconds, seconds, method
+    return None, None, None
 
 
 def calc_hit(tokens):
@@ -54,12 +67,17 @@ def calc_hit(tokens):
 def calc_stats(message):
     info = message.get('time') or {}
     tokens = message.get('tokens')
-    speed, seconds = calc_speed(tokens, info.get('created'), info.get('completed'))
+    speed, seconds, method = calc_speed(tokens, info.get('created'),
+                                        info.get('streamed'), info.get('completed'))
+    created = info.get('created')
+    mid = message.get('id') or ''
     return {
+        'key': (created if isinstance(created, (int, float)) else 0, mid),
         'tokens': tokens if tokens else None,
         'hit': calc_hit(tokens),
         'speed': speed,
         'seconds': seconds,
+        'method': method,
         'model': message.get('model'),
     }
 
@@ -70,16 +88,99 @@ def is_completed(message):
 
 
 def find_completed(messages):
-    checked = 0
     for message in messages:
         if message.get('type') != 'assistant' or not message.get('id'):
             continue
-        if checked >= SCAN_LIMIT:
-            return None
-        checked += 1
         if is_completed(message):
             return message
     return None
+
+
+def model_key(model):
+    if not isinstance(model, dict):
+        return None
+    return json.dumps(model, sort_keys=True)
+
+
+def message_to_sample(message):
+    """加重平均のサンプル。streamed基準(measured)の正常完了 step のみ。"""
+    if not is_completed(message):
+        return None
+    info = message.get('time') or {}
+    speed, seconds, method = calc_speed(message.get('tokens'), info.get('created'),
+                                        info.get('streamed'), info.get('completed'))
+    if method != 'measured':
+        return None
+    tokens = message.get('tokens')
+    total = (tokens.get('output', 0) or 0) + (tokens.get('reasoning', 0) or 0)
+    mid = message.get('id')
+    if total <= 0 or not isinstance(mid, str) or not mid:
+        return None
+    return (info['created'], mid, total, seconds)
+
+
+class Aggregation:
+    """同一セッション・同一モデルの直近10サンプル加重平均を管理する。
+
+    samples は (created, mid, 出力トークン, 秒数) の昇順リスト。
+    """
+
+    def __init__(self):
+        self.model = None
+        self.model_obj = None
+        self.samples = []
+
+    def clear(self):
+        self.model = None
+        self.model_obj = None
+        self.samples = []
+
+    def add_message(self, message):
+        if not isinstance(message, dict):
+            return False
+        key = model_key(message.get('model'))
+        if key is None:
+            return False
+        changed = False
+        if key != self.model:
+            self.model = key
+            self.model_obj = message.get('model')
+            self.samples = []
+            changed = True
+        sample = message_to_sample(message)
+        if sample is None:
+            return changed
+        return self.add_sample(sample) or changed
+
+    def add_sample(self, sample):
+        for existing in self.samples:
+            if existing[1] == sample[1]:
+                return False
+        self.samples.append(sample)
+        self.samples.sort(key=lambda item: (item[0], item[1]))
+        if len(self.samples) > AVG_SAMPLES:
+            self.samples = self.samples[-AVG_SAMPLES:]
+        return True
+
+    def average(self):
+        if not self.samples:
+            return None
+        total = 0
+        seconds = 0.0
+        for sample in self.samples:
+            total += sample[2]
+            seconds += sample[3]
+        if total <= 0 or seconds <= 0:
+            return None
+        return total / seconds
+
+    def usage(self):
+        if not self.samples:
+            return None
+        text = '直近%d回の加重平均' % len(self.samples)
+        if self.model_obj:
+            text += '・' + fmt_model(self.model_obj)
+        return text
 
 
 def fmt_tok(value):
@@ -91,16 +192,12 @@ def fmt_tok(value):
     return str(value)
 
 
-def fmt_speed(value, seconds):
+def fmt_speed(value):
     if value is None:
         return '計測不可'
     if value >= 1000:
-        out = '%.1fK tok/s' % (value / 1000)
-    else:
-        out = '%.1f tok/s' % value
-    if seconds is not None:
-        out += ' (%.1fs)' % seconds
-    return out
+        return '%.1fK tok/s' % (value / 1000)
+    return '%.1f tok/s' % value
 
 
 def fmt_hit(value):
@@ -185,7 +282,8 @@ class Service:
         return self.get('/api/session/' + sid).get('data') or {}
 
     def session_messages(self, sid):
-        return self.get('/api/session/%s/message' % sid).get('data') or []
+        return self.get('/api/session/%s/message?type=assistant&limit=20&order=desc'
+                        % sid).get('data') or []
 
     def message_detail(self, sid, mid):
         return self.get('/api/session/%s/message/%s' % (sid, mid)).get('data') or {}
@@ -195,7 +293,7 @@ class Service:
         return list(data) if isinstance(data, dict) else []
 
     def recent_sessions(self):
-        return (self.get('/api/session').get('data') or [])[:20]
+        return self.get('/api/session?limit=20').get('data') or []
 
 
 class App:
@@ -206,21 +304,29 @@ class App:
         self.running = True
 
         self.target_sid = None
+        self.target_child = False
         self.pinned_sid = None
         self.active_sids = frozenset()
         self.recent = []
         self.connected = False
         self.status = 'idle'
+        self.agg = Aggregation()
+        self.speed_avg = None
+        self.avg_usage = None
+        self.fallback_speed = None
         self.last_speed = None
         self.last_seconds = None
+        self.last_method = None
+        self.last_key = None
         self.last_hit = None
         self.last_tokens = None
         self.current_model = None
         self.session_titles = {}
+        self.step_retry = {}
 
         self.root = tk.Tk()
         self.root.title('OpenCode 統計')
-        self.root.geometry('330x178+80+80')
+        self.root.geometry('330x200+80+80')
         self.root.attributes('-topmost', True)
         self.root.resizable(False, False)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
@@ -240,8 +346,10 @@ class App:
 
         self.status_label = label(9, 'bold', '#9a9a9a', '未接続')
         self.speed_label = label(17, 'bold', '#7ec8ff', '計測不可')
-        self.hit_label = label(9, 'normal', '#e2e2e2', 'cache hit: 未計測')
-        self.cache_label = label(9, 'normal', '#e2e2e2', 'read: -  write: -')
+        self.usage_label = label(8, 'normal', '#9a9a9a', '')
+        self.hit_label = label(9, 'normal', '#e2e2e2', 'cache hit(直近1回): 未計測')
+        self.cache_label = label(9, 'normal', '#e2e2e2', 'read: -  write: -  input: -')
+        self.last_label = label(8, 'normal', '#9a9a9a', 'last: -')
         self.model_label = label(8, 'normal', '#9a9a9a', 'model: -')
         self.session_label = label(8, 'normal', '#9a9a9a', 'session: -')
 
@@ -258,8 +366,8 @@ class App:
         menu.add_radiobutton(label='自動（実行中セッションを追従）',
                              variable=self.menu_pin, value='__auto__',
                              command=self.release_pin)
-        for sid, title, running in self.recent:
-            mark = ('[実行中] ' if running else '') + (title or sid)
+        for sid, title, running, child in self.recent:
+            mark = ('[実行中] ' if running else '') + ('[子] ' if child else '') + (title or sid)
             menu.add_radiobutton(label=mark, variable=self.menu_pin, value=sid,
                                  command=lambda s=sid: self.pin_session(s))
         menu.add_separator()
@@ -347,6 +455,8 @@ class App:
                     self.job_target_sync(sid)
                 elif kind == 'step-detail':
                     self.job_step_detail(sid, mid)
+                elif kind == 'execution-check':
+                    self.job_execution_check(sid)
             except queue.Empty:
                 now = time.time()
                 if self.connected and now - last_refresh >= 15.0:
@@ -369,25 +479,52 @@ class App:
             if not sid:
                 continue
             title = session.get('title') or 'no title'
-            recent.append((sid, title, sid in active))
+            recent.append((sid, title, sid in active, bool(session.get('parentID'))))
             titles[sid] = title
         self.q.put(('session-list', recent, titles))
 
     def job_target_sync(self, sid):
         info = self.service.session_info(sid)
         title = info.get('title') or 'no title'
-        stat = calc_stats(find_completed(self.service.session_messages(sid)) or {})
+        messages = self.service.session_messages(sid)
+        stat = calc_stats(find_completed(messages) or {})
+        ordered = list(reversed(messages))
         self.q.put(('target-stats', sid, {
             'title': title,
             'stat': stat,
+            'messages': ordered,
             'model': stat.get('model') or info.get('model'),
             'running': sid in self.service.active_sessions(),
+            'child': bool(info.get('parentID')),
         }))
 
     def job_step_detail(self, sid, mid):
-        detail = self.service.message_detail(sid, mid)
-        if is_completed(detail):
-            self.q.put(('step-stats', sid, calc_stats(detail)))
+        key = (sid, mid)
+        try:
+            detail = self.service.message_detail(sid, mid)
+        except Exception:
+            detail = None
+        if not is_completed(detail):
+            attempts = self.step_retry.get(key, 0) + 1
+            self.step_retry[key] = attempts
+            if attempts <= 3:
+                timer = threading.Timer(1.5, lambda: self.apiq.put(('step-detail', sid, mid)))
+                timer.daemon = True
+                timer.start()
+            else:
+                self.step_retry.pop(key, None)
+            return
+        self.step_retry.pop(key, None)
+        self.q.put(('step-stats', sid, detail))
+
+    def job_execution_check(self, sid):
+        try:
+            info = self.service.session_info(sid)
+        except Exception:
+            return
+        if info.get('parentID'):
+            return
+        self.q.put(('execution-target', sid, None))
 
     def poll_queue(self):
         if not self.running:
@@ -420,29 +557,49 @@ class App:
             self.session_titles = extra or {}
             self.apply_target()
         elif kind == 'target-stats':
-            sid, data = param, extra
-            if sid != self.target_sid:
-                return
-            title = data.get('title')
-            if title and title != 'no title':
-                self.session_titles[sid] = title
-            stat = data.get('stat') or {}
-            if stat.get('speed') is not None or stat.get('tokens'):
-                self.apply_stats(stat)
-            self.current_model = data.get('model') or self.current_model
-            if data.get('running'):
-                self.status = 'running'
+            self.on_target_stats(param, extra)
         elif kind == 'step-stats':
-            sid, data = param, extra
-            if sid != self.target_sid:
+            self.on_step_stats(param, extra)
+        elif kind == 'execution-target':
+            sid = param
+            if self.pinned_sid and sid != self.pinned_sid:
                 return
-            self.apply_stats(data)
+            self.switch_target(sid)
+            self.status = 'running'
         elif kind == 'execution':
             self.on_execution(param, extra)
+
+    def on_target_stats(self, sid, data):
+        if sid != self.target_sid:
+            return
+        title = data.get('title')
+        if title and title != 'no title':
+            self.session_titles[sid] = title
+        self.target_child = bool(data.get('child'))
+        model = data.get('model')
+        self.current_model = model or self.current_model
+        for message in data.get('messages') or []:
+            self.agg.add_message(message)
+        self.speed_avg = self.agg.average()
+        self.avg_usage = self.agg.usage()
+        stat = data.get('stat') or {}
+        if stat.get('speed') is not None or stat.get('tokens'):
+            self.apply_stats(stat, model)
+        if data.get('running'):
+            self.status = 'running'
+
+    def on_step_stats(self, sid, message):
+        if sid != self.target_sid:
+            return
+        self.agg.add_message(message)
+        self.apply_stats(calc_stats(message), message.get('model'))
 
     def on_execution(self, sid, sub):
         if sub == 'started':
             if self.pinned_sid and sid != self.pinned_sid:
+                return
+            if sid != self.target_sid:
+                self.apiq.put(('execution-check', sid, None))
                 return
             self.switch_target(sid)
             self.status = 'running'
@@ -454,6 +611,7 @@ class App:
             return
         if sid != self.target_sid:
             self.target_sid = sid
+            self.target_child = False
             self.reset_stats()
         self.apiq.put(('target-sync', sid, None))
 
@@ -463,9 +621,9 @@ class App:
         elif self.target_sid and self.target_sid in self.active_sids:
             sid = self.target_sid
         elif self.active_sids:
-            candidates = [sid for sid, title, running in self.recent
-                          if sid in self.active_sids]
-            sid = candidates[0] if candidates else self.target_sid
+            mains = [sid for sid, title, running, child in self.recent
+                     if sid in self.active_sids and not child]
+            sid = mains[0] if mains else self.target_sid
         elif self.target_sid:
             sid = self.target_sid
         elif self.recent:
@@ -475,18 +633,39 @@ class App:
         self.switch_target(sid)
 
     def reset_stats(self):
-        self.last_tokens = None
-        self.last_hit = None
+        self.agg.clear()
+        self.speed_avg = None
+        self.avg_usage = None
+        self.fallback_speed = None
         self.last_speed = None
         self.last_seconds = None
+        self.last_method = None
+        self.last_key = None
+        self.last_hit = None
+        self.last_tokens = None
         self.current_model = None
 
-    def apply_stats(self, data):
-        self.last_tokens = data.get('tokens')
-        self.last_hit = data.get('hit')
+    def apply_stats(self, data, default_model=None):
+        if not data.get('tokens') and data.get('speed') is None:
+            return
+        key = data.get('key') or (0, '')
+        if self.last_key is not None and key < self.last_key:
+            return
+        self.last_key = key
+        if data.get('tokens'):
+            self.last_tokens = data['tokens']
+            self.last_hit = data.get('hit')
         self.last_speed = data.get('speed')
         self.last_seconds = data.get('seconds')
-        self.current_model = data.get('model') or self.current_model
+        self.last_method = data.get('method')
+        self.current_model = data.get('model') or default_model or self.current_model
+        self.speed_avg = self.agg.average()
+        self.avg_usage = self.agg.usage()
+        if self.speed_avg is None and data.get('method') == 'fallback' \
+                and data.get('speed') is not None:
+            self.fallback_speed = data['speed']
+        else:
+            self.fallback_speed = None
 
     def render(self):
         if not self.connected:
@@ -496,21 +675,37 @@ class App:
         else:
             text, color = '待機', '#9a9a9a'
         self.status_label.config(text=text, fg=color)
-        self.speed_label.config(text=fmt_speed(self.last_speed, self.last_seconds))
-        self.hit_label.config(text='cache hit: ' + fmt_hit(self.last_hit))
+        if self.speed_avg is not None:
+            self.speed_label.config(text=fmt_speed(self.speed_avg), fg='#7ec8ff')
+            self.usage_label.config(text=self.avg_usage or '', fg='#9a9a9a')
+        elif self.fallback_speed is not None:
+            self.speed_label.config(text=fmt_speed(self.fallback_speed), fg='#e8b46a')
+            self.usage_label.config(text='参考値(直近1回・完了までの実測)', fg='#e8b46a')
+        else:
+            self.speed_label.config(text='計測不可', fg='#9a9a9a')
+            self.usage_label.config(text='', fg='#9a9a9a')
+        self.hit_label.config(text='cache hit(直近1回): ' + fmt_hit(self.last_hit))
         if self.last_tokens:
             cache = self.last_tokens.get('cache') or {}
-            self.cache_label.config(text='read: %s  write: %s' % (
+            self.cache_label.config(text='read: %s  write: %s  input: %s' % (
                 fmt_tok(cache.get('read', 0) or 0),
-                fmt_tok(cache.get('write', 0) or 0)))
+                fmt_tok(cache.get('write', 0) or 0),
+                fmt_tok(self.last_tokens.get('input', 0) or 0)))
         else:
-            self.cache_label.config(text='read: -  write: -')
+            self.cache_label.config(text='read: -  write: -  input: -')
+        if self.last_speed is not None and self.last_seconds is not None:
+            mode = '応答区間' if self.last_method == 'measured' else '完了区間'
+            self.last_label.config(text='last: %.1f tok/s (%s %.1fs)' % (
+                self.last_speed, mode, self.last_seconds))
+        else:
+            self.last_label.config(text='last: -')
         self.model_label.config(text='model: ' + fmt_model(self.current_model))
         sid = self.target_sid
         title = self.session_titles.get(sid) if sid else None
         label = title if title else (sid or '-')
         pin = '[固定] ' if self.pinned_sid == sid else ''
-        self.session_label.config(text='session: ' + pin + label)
+        child = '[子] ' if self.target_child else ''
+        self.session_label.config(text='session: ' + pin + child + label)
 
     def close(self):
         self.running = False

@@ -12,31 +12,46 @@ python opencode_stats.py
 
 - OpenCode Desktop が起動済みの状態で実行する。ツール単体で共有サービスは起動しない。
 - サービス登録は `~/.local/state/opencode/service.json` を読み、認証は Basic(`opencode:<password>`)。
-- 登録ファイルの変化は 5 秒毎に確認し、Desktop 再起動で URL・認証情報が変わっても自動で再接続する。
+- 登録ファイルは API リクエストごとに mtime を比較し、変化があれば URL・認証情報を再読込する。
 
 ## 表示内容
 
 - 実行状態: 未接続 / 生成中 / 待機。生成中判定は `session.execution.started` イベントと
   `/api/session/active` への実行状態照会に基づく。step 終了だけでは待機に戻さない。
-- 実効速度: 最新の正常完了 step の `(output + reasoning) / (created - completed)`。
-  - 生成開始から完了までの実効 tok/s。括弧内は計測に使った経過秒。
-  - 経過 0.05 秒未満の一括出力・600 秒超・時刻やトークンを持たない応答は「計測不可」表示。
-  - 一覧は最新のものから最大 5 件まで遡り、`time.completed` と `tokens` を持つ最初の assistant メッセージだけを採用する。生成途中のメッセージで確定済みの数値を上書きしない。
-- cache hit 率: `read / (input + read + write) * 100`、同一 step 単位。read/write が両方 0 のときは「未計測」。
-- キャッシュ読み取り・書き込みトークン数。
+- 実効速度(tok/s): 同一セッション・同一モデルの直近 10 回の加重平均
+  `Σ(output + reasoning) / Σ(streamed - created)`。
+  - 計測区間はモデル応答区間(`time.created` → `time.streamed`)を優先し、ツール実行や後処理を含めない。
+  - `streamed` を持たない応答は平均に混ぜず、直近 1 回の `(completed - created)` 基準の値を参考値(橙色表示)として扱う。
+  - 生成途中やトークンを持たないメッセージ、経過 0.05 秒未満・600 秒超の応答はサンプルから除外。
+  - 起動時・セッション切替時に `/api/session/{sid}/message?type=assistant&limit=20&order=desc` から
+    過去の正常完了 step を最大 10 件取得して平均を復元する。
+  - モデルまたは対象セッションが変わると平均をリセットする。
+- last 行: 直近 1 step の単発 tok/s と計測区間(応答区間 / 完了区間)。平均との突合・デバッグ用。
+- cache hit 率(直近 1 回): `read / (input + read + write) * 100`。read/write が両方 0 のときは「未計測」。
+- キャッシュ read / write / input トークン数(直近 1 回)。キャッシュ統計は平均せず常に最新 1 step の値。
 - 対象モデルと対象セッションのタイトル(補助表示)。セッション切替時は統計をリセットし、前セッションの数値を引き継がない。
 
 ## 操作
 
 - 右クリックメニュー:
   - 統計を再取得
-  - 対象セッションの選択(自動追従 or 固定)
+  - 対象セッションの選択(自動追従 or 固定)。子セッション(parentID を持つサブエージェント)には `[子]` を表示
   - 常に最前面
   - 閉じる
 
 ## 実装メモ
 
-- OpenCode 2.0.30 の `/api/event`(SSE) を購読し、起動時とイベント発火時に `/api/session`、`/api/session/{sid}`、`/api/session/{sid}/message`、`/api/session/{sid}/message/{mid}`、`/api/session/active` を読み取る。統計は `session.step.ended` 発火時に該当メッセージ詳細から再計算する。
+- OpenCode 2.0.30 の `/api/event`(SSE) を購読し、起動時とイベント発火時に `/api/session`、`/api/session/{sid}`、
+  `/api/session/{sid}/message`、`/api/session/{sid}/message/{mid}`、`/api/session/active` を読み取る。
+  統計は `session.step.ended` 発火時に該当メッセージ詳細から再計算する。
+- OpenCode には `created`(モデルリクエスト開始) / `streamed`(応答ストリーム終了) / `completed`(後処理込み完了) の
+  3 つの時刻がある。`completed - created` はツール実行時間を含むため、速度計測には使わない。
+- セッション一覧とメッセージ取得は API 側に `limit` / `order` / `type` を指定し、全件取得しない。
+  メッセージは `type=assistant&limit=20&order=desc` で最新 20 件のみ。
+- 同一 step の重複取得と、より新しい結果を既に表示している場合の古い結果の適用は、
+  メッセージ ID と `time.created` の順序比較で除外する。15 秒ごとの定期取得が表示を後退させない。
+- 実行セッションの追従時は `/api/session/{sid}` の `parentID` を確認し、子セッション(サブエージェント)の
+  実行で対象を切り替えない。親セッション優先。固定(ピン)中はピン以外の実行を無視する。
 - event frames は `{"id", "type", "data": {sessionID, ...}}`。15 秒ごとの `: heartbeat` コメント行も破棄する。
 - SSE は live-only。切断時は 2 秒後に再接続し、対象セッションの最新確定値を再取得する。
 - HTTP は標準の urllib.request で、次の制限をかける。
@@ -46,4 +61,5 @@ python opencode_stats.py
 - Tk メインスレッドは描画とキュー投入のみで、HTTP 通信は SSE 読み取りスレッドと API ワーカースレッドで実行する。
 - 401 応答時は URL・認証・mtime キャッシュを破棄し、次回 `service.json` から再読み込みする。
 - 標準ライブラリのみ。外部通信は 127.0.0.1 の既存サービスのみで、Secrets・会話本文を永続保存しない。
-- コード量約 525 行（空行を含む総行数）。
+- テスト: `python -m unittest test_opencode_stats`（計測ロジック・集計・API クエリ生成、外部通信なし）。
+- コード量: opencode_stats.py 約 633 行 / test_opencode_stats.py 約 160 行（空行を含む総行数）。
